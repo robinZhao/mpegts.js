@@ -128,11 +128,36 @@ class MP4Remuxer {
         this._videoSegmentInfoList.clear();
         this._audioSegmentInfoList.clear();
     }
+    correctionVideoDts(videoTrack){
+        let outOrderSamples=[];
+        let preDts = this._videoStashedLastSample?.dts||0;
+        for(let i=0;i<videoTrack.samples.length;i++){
+            let dts =  videoTrack.samples[i].dts;
+            if(dts<=preDts){
+                outOrderSamples.push(videoTrack.samples[i]);
+            }else{
+                if(outOrderSamples.length>0){
+                    let duration = (dts-preDts)/(outOrderSamples.length+1)
+                    for(let j=0;j<outOrderSamples.length;j++){
+                        outOrderSamples[j].dts = preDts+ (j+1)*duration;
+                        outOrderSamples[j].cts = outOrderSamples[j].pts-outOrderSamples[j].dts;
+                    }
+                }
+                outOrderSamples=[];
+                preDts = dts;
+            }
+        }
+        for(let j=0;j<outOrderSamples.length;j++){
+            outOrderSamples[j].dts = preDts+ (j+1)*1;
+            outOrderSamples[j].cts = outOrderSamples[j].pts-outOrderSamples[j].dts;
+        }
+    }
 
     remux(audioTrack, videoTrack) {
         if (!this._onMediaSegment) {
             throw new IllegalStateException('MP4Remuxer: onMediaSegment callback must be specificed!');
         }
+        this.correctionVideoDts(videoTrack);
         if (!this._dtsBaseInited) {
             this._calculateDtsBase(audioTrack, videoTrack);
         }
@@ -453,6 +478,9 @@ class MP4Remuxer {
                     } else {  // the only one sample, use reference sample duration
                         sampleDuration = Math.floor(refSampleDuration);
                     }
+                }
+                if(sampleDuration<0){
+                    sampleDuration=0;
                 }
                 this._audioNextDts = dts + sampleDuration;
             }
