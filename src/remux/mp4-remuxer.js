@@ -670,6 +670,8 @@ class MP4Remuxer {
 
         let info = new MediaSegmentInfo();
         let mp4Samples = [];
+        let idxSortedMap = Array.from(samples,(_,i)=>i);
+        idxSortedMap.sort((a,b)=>samples[a].pts-samples[b].pts);
 
         // Correct dts for each sample, and calculate sample duration. Then output to mp4Samples
         for (let i = 0; i < samples.length; i++) {
@@ -686,21 +688,23 @@ class MP4Remuxer {
             }
 
             let sampleDuration = 0;
-
-            if (i !== samples.length - 1) {
-                let nextDts = samples[i + 1].dts - this._dtsBase - dtsCorrection;
-                sampleDuration = nextDts - dts;
+            let j = idxSortedMap.indexOf(i);
+            if (j !== samples.length - 1) {
+                let nextPts = samples[idxSortedMap[j+1]].pts - this._dtsBase - dtsCorrection;
+                sampleDuration = nextPts - pts;
             } else {  // the last sample
                 if (lastSample != null) {  // use stashed sample's dts to calculate sample duration
-                    let nextDts = lastSample.dts - this._dtsBase - dtsCorrection;
-                    sampleDuration = nextDts - dts;
+                    let nextPts = lastSample.pts - this._dtsBase - dtsCorrection;
+                    sampleDuration = nextPts - pts;
                 } else if (mp4Samples.length >= 1) {  // use second last sample duration
                     sampleDuration = mp4Samples[mp4Samples.length - 1].duration;
                 } else {  // the only one sample, use reference sample duration
                     sampleDuration = Math.floor(this._videoMeta.refSampleDuration);
                 }
             }
-
+            if(sampleDuration<0){
+                sampleDuration=0;
+            }
             if (isKeyframe) {
                 let syncPoint = new SampleInfo(dts, pts, sampleDuration, sample.dts, true);
                 syncPoint.fileposition = sample.fileposition;
