@@ -36,7 +36,7 @@
         </div>
         <div class="video-container">
             <div>
-                <video name="videoElement" class="centeredVideo" controls autoplay playsinline>
+                <video name="videoElement" class="centeredVideo" controls autoplay playsinline muted>
                     Your browser is too old which doesn't support HTML5 video.
                 </video>
             </div>
@@ -55,6 +55,8 @@
     <script src="../dist/mpegts.js"></script>
     
     <script>
+
+        mpegts.LoggingControl.enableAll=true;
         var checkBoxFields = ['isLive', 'withCredentials', 'liveBufferLatencyChasing'];
         var streamURL, mediaSourceURL;
 
@@ -74,6 +76,7 @@
                 var i;
                 var mediaDataSource = {
                     type: 'mse'
+                    //type:'native'
                 };
                 for (i = 0; i < checkBoxFields.length; i++) {
                     var field = checkBoxFields[i];
@@ -85,6 +88,7 @@
                 console.log('MediaDataSource', mediaDataSource);
                 player_load_mds(mediaDataSource);
             }
+            player.play();
         }
 
         function player_load_mds(mediaDataSource) {
@@ -98,11 +102,22 @@
                 }
             }
             player = mpegts.createPlayer(mediaDataSource, {
-                enableWorker: true,
                 lazyLoadMaxDuration: 3 * 60,
                 seekType: 'range',
                 liveBufferLatencyChasing: document.getElementById('liveBufferLatencyChasing').checked,
+
+                isLive: true,
+                enableWorker: true,
+                enableWorkerForMSE: false,
+                liveBufferLatencyMinRemain: 0.2,
+                liveSyncTargetLatency:0.4,
+                lazyLoadMaxDuration:60,
+                autoCleanupSourceBuffer:true,
+                liveSync:true
             });
+            player.on(mpegts.Events.STATISTICS_INFO, e => {
+              //  console.log(e.decodedFrames);
+            })
             player.attachMediaElement(element);
             player.load();
         }
