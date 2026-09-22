@@ -129,18 +129,37 @@ class MP4Remuxer {
         this._audioSegmentInfoList.clear();
     }
     correctionVideoDts(videoTrack){
+        // TSDemuxer dispatches (audioTrack, null) on audio-metadata-change flushes,
+        // so videoTrack must be null-checked before touching its samples.
+        if (!videoTrack || !videoTrack.samples || videoTrack.samples.length === 0) {
+            return;
+        }
         let outOrderSamples=[];
-        let preDts = this._videoStashedLastSample?.dts||0;
+        // Sentinel must not be 0: the first segment's first frame can legally have
+        // dts === 0 and would otherwise be treated as regressed.
+        let preDts = (this._videoStashedLastSample != null) ? this._videoStashedLastSample.dts : -Infinity;
+        // trun writes sample_composition_time_offset as unsigned 32-bit, so a negative
+        // cts wraps to ~2^32 and the frame never displays; keep cts >= 0 by advancing
+        // pts (display time already in the past) instead of leaving dts ahead of pts.
+        const assign = (sample, newDts) => {
+            if (newDts > sample.pts) {
+                sample.pts = newDts;
+                sample.cts = 0;
+            } else {
+                sample.dts = newDts;
+                sample.cts = sample.pts - newDts;
+            }
+        };
         for(let i=0;i<videoTrack.samples.length;i++){
             let dts =  videoTrack.samples[i].dts;
             if(dts<=preDts){
                 outOrderSamples.push(videoTrack.samples[i]);
             }else{
                 if(outOrderSamples.length>0){
-                    let duration = (dts-preDts)/(outOrderSamples.length+1)
+                    // Integer step (>= 1ms): keeps dts strictly monotonic and integral
+                    let step = Math.max(1, Math.floor((dts-preDts)/(outOrderSamples.length+1)));
                     for(let j=0;j<outOrderSamples.length;j++){
-                        outOrderSamples[j].dts = preDts+ (j+1)*duration;
-                        outOrderSamples[j].cts = outOrderSamples[j].pts-outOrderSamples[j].dts;
+                        assign(outOrderSamples[j], preDts+ (j+1)*step);
                     }
                 }
                 outOrderSamples=[];
@@ -148,8 +167,7 @@ class MP4Remuxer {
             }
         }
         for(let j=0;j<outOrderSamples.length;j++){
-            outOrderSamples[j].dts = preDts+ (j+1)*1;
-            outOrderSamples[j].cts = outOrderSamples[j].pts-outOrderSamples[j].dts;
+            assign(outOrderSamples[j], preDts+ (j+1)*1);
         }
     }
 
