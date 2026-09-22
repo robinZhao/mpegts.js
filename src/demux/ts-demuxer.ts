@@ -125,6 +125,11 @@ class TSDemuxer extends BaseDemuxer {
     private content_sniff_counts_: { [pid: number]: number } = {};
     private readonly content_sniff_max_: number = 200;
 
+    // PIDs registered by content sniffing. Kept separately from pmt_ because every
+    // parsed PMT replaces the pmt_ object and would wipe the registrations; they are
+    // re-applied to the new PMT by applyDetectedPids.
+    private detected_pids_: { [pid: number]: StreamType } = {};
+
     private video_metadata_: {
         vps: H265NaluHVC1 | undefined,
         sps: H264NaluAVC1 | H265NaluHVC1 | undefined,
@@ -946,6 +951,9 @@ class TSDemuxer extends BaseDemuxer {
                 Log.v(this.TAG, `Parsed first PMT: ${JSON.stringify(pmt)}`);
             }
             this.pmt_ = pmt;
+            // A parsed PMT replaces the whole object, which would wipe pids registered
+            // by content sniffing; re-apply them so they survive periodic PMT refreshes.
+            this.applyDetectedPids(pmt);
             if (pmt.common_pids.h264 || pmt.common_pids.h265 || pmt.common_pids.av1) {
                 this.has_video_ = true;
             }
@@ -996,9 +1004,12 @@ class TSDemuxer extends BaseDemuxer {
             return StreamType.kH264;
         }
 
-        // 2) AAC ADTS fallback: sync word 0xFFF with MPEG-4 (id=0), no layer (layer=00)
+        // 2) AAC ADTS fallback: 12-bit sync 0xFFF + id=0 (MPEG-4) + layer=00.
+        // byte1: [sync 1111][id 1][layer 00][protection 1] -> id=0 & layer=00 gives 0xF0/0xF1;
+        // the low-3-bits check also rejects MP3 frame headers (e.g. 0xFD/0xFE, MPEG-1
+        // Layer III, low 3 bits >= 2).
         for (let i = 0; i + 2 <= payload.byteLength; i++) {
-            if (payload[i] === 0xFF && (payload[i + 1] & 0xF8) === 0xF8) {
+            if (payload[i] === 0xFF && (payload[i + 1] & 0xF0) === 0xF0 && (payload[i + 1] & 0x07) <= 1) {
                 return StreamType.kADTSAAC;
             }
         }
@@ -1018,6 +1029,7 @@ class TSDemuxer extends BaseDemuxer {
             this.pmt_.pcr_pid = -1;
         }
         this.pmt_.pid_stream_type[pid] = stream_type;
+        this.detected_pids_[pid] = stream_type;
 
         // The content-detected pid is the one that actually carries data, so set it as the
         // primary video/audio pid (overwriting any empty/wrong PMT declaration).
@@ -1038,6 +1050,30 @@ class TSDemuxer extends BaseDemuxer {
         }
 
         Log.i(this.TAG, `PMT does not cover this pid, detected stream by content: pid=0x${pid.toString(16).toUpperCase()}, type=${stream_type}`);
+    }
+
+    /**
+     * Re-apply content-detected pids after a parsed PMT has replaced pmt_. Without this,
+     * every periodic PMT refresh would wipe the registrations and, once the sniff budget
+     * (content_sniff_max_) is exhausted, the media pids would be dropped forever.
+     * Pids the new PMT itself covers keep PMT authority.
+     */
+    private applyDetectedPids(pmt: PMT): void {
+        for (let pidStr in this.detected_pids_) {
+            let pid = Number(pidStr);
+            let stream_type = this.detected_pids_[pidStr];
+            if (pmt.pid_stream_type[pid] != undefined) {
+                continue;
+            }
+            pmt.pid_stream_type[pid] = stream_type;
+            if (stream_type === StreamType.kH264) {
+                pmt.common_pids.h264 = pid;
+            } else if (stream_type === StreamType.kH265) {
+                pmt.common_pids.h265 = pid;
+            } else if (stream_type === StreamType.kADTSAAC) {
+                pmt.common_pids.adts_aac = pid;
+            }
+        }
     }
 
     private parseSCTE35(data: Uint8Array): void {
@@ -1197,8 +1233,10 @@ class TSDemuxer extends BaseDemuxer {
             // nal_unit_type=4 with nuh_temporal_id_plus1=0, which the spec forbids;
             // hardware decoders (Chrome) abort with PIPELINE_ERROR_DECODE once
             // non-IDR frames arrive. Substitute a valid H.265 AUD, preserving the
-            // access unit boundary the muxer intended.
-            if (nalu_payload.data.byteLength >= 2 && (nalu_payload.data[1] & 0x07) === 0) {
+            // access unit boundary the muxer intended. data[0] === 0x09 restricts the
+            // replacement to the H.264 AUD (nal_unit_type 9) so a malformed VPS/SPS/PPS
+            // with the forbidden temporal_id_plus1=0 is never swallowed.
+            if (nalu_payload.data.byteLength >= 2 && nalu_payload.data[0] === 0x09 && (nalu_payload.data[1] & 0x07) === 0) {
                 let aud = new H265NaluPayload();
                 aud.type = H265NaluType.kSliceAUD;
                 aud.data = new Uint8Array([0x46, 0x01, 0x50]);

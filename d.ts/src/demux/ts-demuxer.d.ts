@@ -17,6 +17,7 @@ declare class TSDemuxer extends BaseDemuxer {
     private section_slice_queues_;
     private content_sniff_counts_;
     private readonly content_sniff_max_;
+    private detected_pids_;
     private video_metadata_;
     private audio_metadata_;
     private last_pcr_;
@@ -78,6 +79,13 @@ declare class TSDemuxer extends BaseDemuxer {
      * existing PES processing path can handle it.
      */
     private registerDetectedPid;
+    /**
+     * Re-apply content-detected pids after a parsed PMT has replaced pmt_. Without this,
+     * every periodic PMT refresh would wipe the registrations and, once the sniff budget
+     * (content_sniff_max_) is exhausted, the media pids would be dropped forever.
+     * Pids the new PMT itself covers keep PMT authority.
+     */
+    private applyDetectedPids;
     private parseSCTE35;
     private parseAV1Payload;
     private parseH264Payload;
