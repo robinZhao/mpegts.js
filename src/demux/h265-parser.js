@@ -355,8 +355,6 @@ class H265NaluParser {
         let sps_extension_flag = gb.readBool(); // ignore...
 
         // for meta data
-        let codec_mimetype = `hvc1.${general_profile_idc}.1.L${general_level_idc}.B0`;
-
         let sub_wc = (chroma_format_idc === 1 || chroma_format_idc === 2) ? 2 : 1;
         let sub_hc = (chroma_format_idc === 1) ? 2 : 1;
         let codec_width = pic_width_in_luma_samples - (left_offset + right_offset) * sub_wc;
@@ -366,20 +364,27 @@ class H265NaluParser {
             sar_scale = sar_width / sar_height;
         }
 
+        // Raise the declared level if the actual luma sample rate exceeds it, so hardware
+        // HEVC decoders allocate enough resources to decode P/B frames.
+        let effective_level_idc = Math.max(general_level_idc,
+                                           H265NaluParser.calcMinLevelIdc(codec_width, codec_height, fps_num / fps_den));
+
+        let codec_mimetype = `hvc1.${general_profile_idc}.1.L${effective_level_idc}.B0`;
+
         gb.destroy();
         gb = null;
 
         return {
             codec_mimetype,
             profile_string: H265NaluParser.getProfileString(general_profile_idc),
-            level_string: H265NaluParser.getLevelString(general_level_idc),
+            level_string: H265NaluParser.getLevelString(effective_level_idc),
             profile_idc: general_profile_idc,
             bit_depth: bit_depth_luma_minus8 + 8,
             ref_frames: 1, // FIXME!!!
             chroma_format: chroma_format_idc,
             chroma_format_string: H265NaluParser.getChromaFormatString(chroma_format_idc),
 
-            general_level_idc,
+            general_level_idc: effective_level_idc,
             general_profile_space,
             general_tier_flag,
             general_profile_idc,
@@ -495,6 +500,35 @@ class H265NaluParser {
 
     static getLevelString(level_idc) {
         return (level_idc / 30).toFixed(1);
+    }
+
+    // Some encoders declare a level lower than the stream actually requires (e.g. a
+    // 4K@30 stream declared as Level 5.0). Browsers that use hardware HEVC decoding
+    // allocate decode resources from the declared level, so P/B frames fail to decode
+    // while the first IDR still renders. Compute the minimum level the luma sample
+    // rate actually needs, so the caller can raise (never lower) the declared value.
+    static calcMinLevelIdc(width, height, fps) {
+        // [level_idc, MaxLumaSr] from H.265 Table A.1
+        let level_table = [
+            [30, 552960], [60, 3686400], [63, 7372800], [90, 16588800],
+            [93, 33177600], [120, 66846720], [123, 133693440], [150, 245862720],
+            [153, 423936000], [156, 1065830400], [180, 1069547520],
+            [183, 2139095040], [186, 4278190080]
+        ];
+
+        let luma_ps = width * height;
+        if (!(luma_ps > 0)) {
+            return 0;
+        }
+        let effective_fps = (fps > 1 && isFinite(fps)) ? fps : 30;
+        let luma_sr = luma_ps * effective_fps;
+
+        for (let i = 0; i < level_table.length; i++) {
+            if (luma_sr <= level_table[i][1]) {
+                return level_table[i][0];
+            }
+        }
+        return 186;  // Level 6.2
     }
 }
 

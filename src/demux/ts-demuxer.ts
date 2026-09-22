@@ -119,6 +119,12 @@ class TSDemuxer extends BaseDemuxer {
     private pes_slice_queues_: PIDToSliceQueues = {};
     private section_slice_queues_: PIDToSliceQueues = {};
 
+    // Content-based PID detection fallback (for streams where the PMT is absent or
+    // declares PIDs that carry no data). Bounded per-pid attempts to avoid scanning
+    // non-media pids forever.
+    private content_sniff_counts_: { [pid: number]: number } = {};
+    private readonly content_sniff_max_: number = 200;
+
     private video_metadata_: {
         vps: H265NaluHVC1 | undefined,
         sps: H264NaluAVC1 | H265NaluHVC1 | undefined,
@@ -338,13 +344,28 @@ class TSDemuxer extends BaseDemuxer {
                                                 continuity_conunter,
                                                 random_access_indicator: adaptation_field_info.random_access_indicator
                                             });
-                } else if (this.pmt_ != undefined && this.pmt_.pid_stream_type[pid] != undefined) {
+                } else {
                     // PES
                     let ts_payload_length = 188 - ts_payload_start_index;
-                    let stream_type = this.pmt_.pid_stream_type[pid];
+
+                    // Resolve stream_type: from PMT if available, else fall back to
+                    // content-based detection (handles streams whose PMT is absent or
+                    // whose declared PIDs carry no data, e.g. some go2rtc H.265 streams).
+                    let stream_type = (this.pmt_ != undefined) ? this.pmt_.pid_stream_type[pid] : undefined;
+                    if (stream_type == undefined) {
+                        let attempts = this.content_sniff_counts_[pid] || 0;
+                        if (attempts < this.content_sniff_max_) {
+                            this.content_sniff_counts_[pid] = attempts + 1;
+                            stream_type = this.detectStreamTypeByContent(data, ts_payload_start_index);
+                            if (stream_type != undefined) {
+                                this.registerDetectedPid(pid, stream_type);
+                            }
+                        }
+                    }
 
                     // process PES only for known common_pids
-                    if (pid === this.pmt_.common_pids.h264
+                    if (stream_type != undefined
+                            && (pid === this.pmt_.common_pids.h264
                             || pid === this.pmt_.common_pids.h265
                             || pid === this.pmt_.common_pids.av1
                             || pid === this.pmt_.common_pids.adts_aac
@@ -358,7 +379,7 @@ class TSDemuxer extends BaseDemuxer {
                             || this.pmt_.pgs_pids[pid] === true
                             || this.pmt_.synchronous_klv_pids[pid] === true
                             || this.pmt_.asynchronous_klv_pids[pid] === true
-                            ) {
+                            )) {
                         this.handlePESSlice(chunk,
                                             offset + ts_payload_start_index,
                                             ts_payload_length,
@@ -934,6 +955,91 @@ class TSDemuxer extends BaseDemuxer {
         }
     }
 
+    /**
+     * Content-based stream type detection. Used as a fallback when the PMT is absent or
+     * does not cover a pid that actually carries media data.
+     * @param data the full 188-byte TS packet
+     * @param payloadStart offset of the packet payload within data
+     */
+    private detectStreamTypeByContent(data: Uint8Array, payloadStart: number): StreamType | undefined {
+        const payload = data.subarray(payloadStart);
+        if (payload.byteLength < 6) {
+            return undefined;
+        }
+
+        // 1) H.264 / H.265: scan for 0x00000001 start codes and score definitive NAL types
+        let h264Score = 0;
+        let h265Score = 0;
+        for (let i = 0; i + 5 <= payload.byteLength; i++) {
+            if (payload[i] === 0x00 && payload[i + 1] === 0x00 && payload[i + 2] === 0x00 && payload[i + 3] === 0x01) {
+                const b = payload[i + 4];
+                if (b < 0x80) {
+                    // H.265 nal_unit_type = (b >> 1) & 0x3F
+                    const t65 = (b >> 1) & 0x3F;
+                    if (t65 === 32) { h265Score += 10; }                // VPS (definitive)
+                    else if (t65 === 34) { h265Score += 6; }           // PPS
+                    else if (t65 === 33) { h265Score += 4; }           // SPS
+                    else if (t65 >= 19 && t65 <= 21) { h265Score += 2; } // IDR_W_RADL / IDR_N_LP / CRA
+                    // H.264 nal_unit_type = b & 0x1F
+                    const t64 = b & 0x1F;
+                    if (t64 === 7) { h264Score += 5; }                 // SPS
+                    else if (t64 === 8) { h264Score += 5; }            // PPS
+                    else if (t64 === 5) { h264Score += 2; }            // IDR
+                }
+                i += 3; // continue just after this start code
+            }
+        }
+        if (h265Score > h264Score && h265Score > 0) {
+            return StreamType.kH265;
+        }
+        if (h264Score > h265Score && h264Score > 0) {
+            return StreamType.kH264;
+        }
+
+        // 2) AAC ADTS fallback: sync word 0xFFF with MPEG-4 (id=0), no layer (layer=00)
+        for (let i = 0; i + 2 <= payload.byteLength; i++) {
+            if (payload[i] === 0xFF && (payload[i + 1] & 0xF8) === 0xF8) {
+                return StreamType.kADTSAAC;
+            }
+        }
+
+        return undefined;
+    }
+
+    /**
+     * Register a pid that was detected by content sniffing into the PMT structures, so the
+     * existing PES processing path can handle it.
+     */
+    private registerDetectedPid(pid: number, stream_type: StreamType): void {
+        if (this.pmt_ == undefined) {
+            this.pmt_ = new PMT();
+            this.pmt_.program_number = 1;
+            this.pmt_.version_number = 0;
+            this.pmt_.pcr_pid = -1;
+        }
+        this.pmt_.pid_stream_type[pid] = stream_type;
+
+        // The content-detected pid is the one that actually carries data, so set it as the
+        // primary video/audio pid (overwriting any empty/wrong PMT declaration).
+        if (stream_type === StreamType.kH264) {
+            this.pmt_.common_pids.h264 = pid;
+        } else if (stream_type === StreamType.kH265) {
+            this.pmt_.common_pids.h265 = pid;
+        } else if (stream_type === StreamType.kADTSAAC) {
+            this.pmt_.common_pids.adts_aac = pid;
+        }
+
+        if (this.pmt_.common_pids.h264 || this.pmt_.common_pids.h265 || this.pmt_.common_pids.av1) {
+            this.has_video_ = true;
+        }
+        if (this.pmt_.common_pids.adts_aac || this.pmt_.common_pids.loas_aac
+                || this.pmt_.common_pids.ac3 || this.pmt_.common_pids.opus || this.pmt_.common_pids.mp3) {
+            this.has_audio_ = true;
+        }
+
+        Log.i(this.TAG, `PMT does not cover this pid, detected stream by content: pid=0x${pid.toString(16).toUpperCase()}, type=${stream_type}`);
+    }
+
     private parseSCTE35(data: Uint8Array): void {
         const scte35 = readSCTE35(data);
 
@@ -1086,6 +1192,19 @@ class TSDemuxer extends BaseDemuxer {
         let keyframe = false;
 
         while ((nalu_payload = annexb_parser.readNextNaluPayload()) != null) {
+            // Some TS muxers (go2rtc among them) inject an H.264-style AUD
+            // (00 00 00 01 09 F0) into H.265 streams. Read as H.265 that is
+            // nal_unit_type=4 with nuh_temporal_id_plus1=0, which the spec forbids;
+            // hardware decoders (Chrome) abort with PIPELINE_ERROR_DECODE once
+            // non-IDR frames arrive. Substitute a valid H.265 AUD, preserving the
+            // access unit boundary the muxer intended.
+            if (nalu_payload.data.byteLength >= 2 && (nalu_payload.data[1] & 0x07) === 0) {
+                let aud = new H265NaluPayload();
+                aud.type = H265NaluType.kSliceAUD;
+                aud.data = new Uint8Array([0x46, 0x01, 0x50]);
+                nalu_payload = aud;
+            }
+
             let nalu_hvc1 = new H265NaluHVC1(nalu_payload);
 
             if (nalu_hvc1.type === H265NaluType.kSliceVPS) {

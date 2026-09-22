@@ -15,6 +15,8 @@ declare class TSDemuxer extends BaseDemuxer {
     private program_pmt_map_;
     private pes_slice_queues_;
     private section_slice_queues_;
+    private content_sniff_counts_;
+    private readonly content_sniff_max_;
     private video_metadata_;
     private audio_metadata_;
     private last_pcr_;
@@ -64,6 +66,18 @@ declare class TSDemuxer extends BaseDemuxer {
     private parsePES;
     private parsePAT;
     private parsePMT;
+    /**
+     * Content-based stream type detection. Used as a fallback when the PMT is absent or
+     * does not cover a pid that actually carries media data.
+     * @param data the full 188-byte TS packet
+     * @param payloadStart offset of the packet payload within data
+     */
+    private detectStreamTypeByContent;
+    /**
+     * Register a pid that was detected by content sniffing into the PMT structures, so the
+     * existing PES processing path can handle it.
+     */
+    private registerDetectedPid;
     private parseSCTE35;
     private parseAV1Payload;
     private parseH264Payload;

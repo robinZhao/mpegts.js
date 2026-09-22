@@ -35,11 +35,11 @@ class Log {
         }
 
         if (console.error) {
-            console.error(str);
+            console.error(str,msg);
         } else if (console.warn) {
-            console.warn(str);
+            console.warn(str,msg);
         } else {
-            console.log(str);
+            console.log(str,msg);
         }
     }
 
