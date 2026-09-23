@@ -1,3 +1,5 @@
+修改mpegts.js，解决dts乱序时的播放失败，支持go2rtc转的ts流播放
+
 mpegts.js  [![npm](https://img.shields.io/npm/v/mpegts.js.svg?style=flat)](https://www.npmjs.com/package/mpegts.js)
 ======
 [日本語](README_ja.md)  [中文说明](README_zh.md)
